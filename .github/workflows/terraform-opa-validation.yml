@@ -161,6 +161,7 @@ jobs:
         else
           echo "✅ Common policies: No violations"
         fi
+        echo "$common_result" > "opa_common_result.json"
         
         # Validate service-specific policies
         total_violations=$common_violations
@@ -272,12 +273,16 @@ jobs:
           let comment = `## ${{ env.JOB_EMOJI }} Terraform OPA Validation Results\n\n`;
           comment += `**Job Status:** ${{ env.JOB_STATUS }}\n`;
           comment += `**Total Violations:** ${process.env.TOTAL_VIOLATIONS || 0}\n\n`;
-          
+
           const resultFiles = ['common', 's3', 'ec2', 'rds', 'iam', 'security', 'cloudwatch', 'lambda', 'apigateway', 'elasticache'];
-          
+
+          // Build table first
           comment += '| Policy Type | Status | Violations |\n';
           comment += '|-------------|--------|------------|\n';
-          
+
+          // Collect violation details to append after the table
+          let violationDetails = '';
+
           for (const policyType of resultFiles) {
             try {
               const filePath = `./opa_${policyType}_result.json`;
@@ -286,32 +291,35 @@ jobs:
                 const violations = result.result?.length || 0;
                 const status = violations === 0 ? '✅' : '❌';
                 comment += `| ${policyType.toUpperCase()} | ${status} | ${violations} |\n`;
-                
+
                 if (violations > 0 && result.result) {
-                  if (!comment.includes('### Violation Details')) {
-                    comment += '\n### 🚨 Violation Details:\n\n';
+                  if (!violationDetails.includes('### 🚨 Violation Details')) {
+                    violationDetails += '\n### 🚨 Violation Details:\n\n';
                   }
-                  comment += `**${policyType.toUpperCase()} Policy Violations:**\n`;
+                  violationDetails += `**${policyType.toUpperCase()} Policy Violations:**\n`;
                   result.result.slice(0, 3).forEach(violation => {
-                    comment += `- ${violation}\n`;
+                    violationDetails += `- ${violation}\n`;
                   });
                   if (result.result.length > 3) {
-                    comment += `- ... and ${result.result.length - 3} more\n`;
+                    violationDetails += `- ... and ${result.result.length - 3} more\n`;
                   }
-                  comment += '\n';
+                  violationDetails += '\n';
                 }
               }
             } catch (error) {
               comment += `| ${policyType.toUpperCase()} | ⚠️ | Error |\n`;
             }
           }
-          
+
+          // Append violation details after the table
+          comment += violationDetails;
+
           if (process.env.TOTAL_VIOLATIONS === '0') {
             comment += '\n🎉 **All policies passed!** Your Terraform plan is compliant.\n';
           } else {
             comment += '\n❌ **Policy violations found!** Please fix them before merging.\n';
           }
-          
+
           github.rest.issues.createComment({
             issue_number: context.issue.number,
             owner: context.repo.owner,
