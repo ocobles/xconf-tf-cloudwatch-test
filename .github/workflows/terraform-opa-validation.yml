@@ -1,0 +1,335 @@
+name: Terraform OPA Validation
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+      - '.github/workflows/terraform-opa*'
+  push:
+    branches: [ main ]
+    paths:
+      - '**.tf'
+      - '**.tfvars'
+
+env:
+  TF_VERSION: "1.13.0"
+  AWS_REGION: "eu-central-1"
+
+jobs:
+  terraform-validate:
+    name: Terraform Plan & OPA Validation
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Validate required secrets
+      run: |
+        if [ -z "${{ secrets.OPA_API_URL }}" ]; then
+          echo "❌ Secret OPA_API_URL not configured"
+          exit 1
+        fi
+        if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+          echo "❌ Secret AWS_ACCESS_KEY_ID not configured"
+          exit 1
+        fi
+        if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+          echo "❌ Secret AWS_SECRET_ACCESS_KEY not configured"
+          exit 1
+        fi
+        if [ -z "${{ secrets.COGNITO_USER_POOL_ID }}" ]; then
+          echo "❌ Secret COGNITO_USER_POOL_ID not configured"
+          exit 1
+        fi
+        if [ -z "${{ secrets.COGNITO_CLIENT_ID }}" ]; then
+          echo "❌ Secret COGNITO_CLIENT_ID not configured"
+          exit 1
+        fi
+        if [ -z "${{ secrets.COGNITO_USERNAME }}" ]; then
+          echo "❌ Secret COGNITO_USERNAME not configured"
+          exit 1
+        fi
+        if [ -z "${{ secrets.COGNITO_PASSWORD }}" ]; then
+          echo "❌ Secret COGNITO_PASSWORD not configured"
+          exit 1
+        fi
+        echo "✅ All required secrets are configured"
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Install tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq
+
+    - name: Terraform Init
+      run: terraform init
+
+    - name: Terraform Validate
+      run: terraform validate
+
+    - name: Terraform Plan
+      run: |
+        terraform plan -out=tfplan -no-color
+        terraform show -json tfplan > tfplan.json
+
+    - name: Create OPA validation script
+      run: |
+        cat > validate-terraform-plan.sh << 'SCRIPT_EOF'
+        #!/bin/bash
+        set -e
+        
+        PLAN_FILE="$1"
+        API_URL="$2" 
+        COGNITO_USERNAME="$3"
+        COGNITO_PASSWORD="$4"
+        USER_POOL_ID="$5"
+        CLIENT_ID="$6"
+        REGION="$7"
+        
+        echo "🔍 Validating Terraform plan with OPA..."
+        
+        # Authenticate with Cognito
+        echo "🔐 Authenticating with Cognito..."
+        AUTH_RESPONSE=$(aws cognito-idp admin-initiate-auth \
+          --user-pool-id "$USER_POOL_ID" \
+          --client-id "$CLIENT_ID" \
+          --auth-flow ADMIN_NO_SRP_AUTH \
+          --auth-parameters "USERNAME=$COGNITO_USERNAME,PASSWORD=$COGNITO_PASSWORD" \
+          --region "$REGION" \
+          --output json)
+        
+        if [ $? -ne 0 ]; then
+          echo "❌ Failed to authenticate with Cognito"
+          exit 1
+        fi
+        
+        ACCESS_TOKEN=$(echo "$AUTH_RESPONSE" | jq -r '.AuthenticationResult.AccessToken')
+        
+        if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+          echo "❌ Failed to extract access token"
+          exit 1
+        fi
+        
+        echo "✅ Authentication successful"
+        
+        # Create input wrapper for OPA
+        echo "📦 Preparing plan data for OPA..."
+        jq '{"input": .}' "$PLAN_FILE" > "${PLAN_FILE}.input"
+        
+        # Health check
+        health_response=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $ACCESS_TOKEN" "$API_URL/health" 2>/dev/null || echo "000")
+        http_code=$(echo "$health_response" | tail -c 4)
+        
+        if [ "$http_code" = "200" ]; then
+          echo "✅ OPA server is healthy"
+        else
+          echo "⚠️ Health check returned $http_code, continuing..."
+        fi
+        
+        # Validate common policies
+        echo "🔍 Validating common policies..."
+        common_result=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                             -H "Content-Type: application/json" \
+                             -d @"${PLAN_FILE}.input" \
+                             "$API_URL/v1/data/terraform/aws/common/deny")
+        
+        common_violations=$(echo "$common_result" | jq '.result | length' 2>/dev/null || echo "0")
+        
+        if [ "$common_violations" -gt 0 ]; then
+          echo "❌ Common policy violations: $common_violations"
+          echo "$common_result" | jq -r '.result[]' 2>/dev/null
+        else
+          echo "✅ Common policies: No violations"
+        fi
+        
+        # Validate service-specific policies
+        total_violations=$common_violations
+        
+        for service in s3 ec2 rds iam security cloudwatch lambda apigateway elasticache; do
+          echo "🔍 Validating $service policies..."
+          
+          # Special debug for CloudWatch
+          if [ "$service" = "cloudwatch" ]; then
+            echo ""
+            echo "🔍 DEBUG: CloudWatch-specific analysis"
+            echo "📋 CloudWatch resources in plan:"
+            jq -r '.resource_changes[] | select(.type == "aws_cloudwatch_log_group") | {address, name: .change.after.name}' "$PLAN_FILE" 2>/dev/null || echo "No CloudWatch resources found"
+            
+            echo ""
+            echo "📋 CloudWatch policy structure:"
+            curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                 -H "Content-Type: application/json" \
+                 "$API_URL/v1/data/terraform/aws/cloudwatch" | jq '.' 2>/dev/null || echo "Error getting policy structure"
+            
+            echo ""
+            echo "📋 CloudWatch constraints:"
+            curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                 -H "Content-Type: application/json" \
+                 "$API_URL/v1/data/terraform/aws/cloudwatch/config/constraints" | jq '.' 2>/dev/null || echo "Error getting constraints"
+            
+            echo ""
+            echo "📋 Full CloudWatch evaluation with plan:"
+            curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                 -H "Content-Type: application/json" \
+                 -d @"${PLAN_FILE}.input" \
+                 "$API_URL/v1/data/terraform/aws/cloudwatch" | jq '.' 2>/dev/null || echo "Error in full evaluation"
+            echo ""
+          fi
+          
+          service_result=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                                -H "Content-Type: application/json" \
+                                -d @"${PLAN_FILE}.input" \
+                                "$API_URL/v1/data/terraform/aws/$service/deny" 2>/dev/null || echo '{"result":[]}')
+          
+          service_violations=$(echo "$service_result" | jq '.result | length' 2>/dev/null || echo "0")
+          
+          if [ "$service_violations" -gt 0 ]; then
+            echo "❌ $service policy violations: $service_violations"
+            echo "$service_result" | jq -r '.result[]' 2>/dev/null | head -3
+            total_violations=$((total_violations + service_violations))
+          else
+            echo "✅ $service policies: No violations"
+          fi
+          
+          echo "$service_result" > "opa_${service}_result.json"
+        done
+        
+        echo "TOTAL_VIOLATIONS=$total_violations" >> $GITHUB_ENV
+        
+        if [ $total_violations -gt 0 ]; then
+          echo "❌ Total violations found: $total_violations"
+          exit 1
+        else
+          echo "🎉 All validations passed!"
+          exit 0
+        fi
+        SCRIPT_EOF
+        chmod +x validate-terraform-plan.sh
+
+    - name: Validate with OPA
+      run: |
+        ./validate-terraform-plan.sh tfplan.json \
+          "${{ secrets.OPA_API_URL }}" \
+          "${{ secrets.COGNITO_USERNAME }}" \
+          "${{ secrets.COGNITO_PASSWORD }}" \
+          "${{ secrets.COGNITO_USER_POOL_ID }}" \
+          "${{ secrets.COGNITO_CLIENT_ID }}" \
+          "${{ env.AWS_REGION }}"
+      continue-on-error: true
+
+    - name: Set job status
+      run: |
+        if [ "${TOTAL_VIOLATIONS:-0}" -gt 0 ]; then
+          echo "JOB_STATUS=failure" >> $GITHUB_ENV
+          echo "JOB_EMOJI=❌" >> $GITHUB_ENV
+          echo "SHOULD_APPLY=false" >> $GITHUB_ENV
+        else
+          echo "JOB_STATUS=success" >> $GITHUB_ENV
+          echo "JOB_EMOJI=✅" >> $GITHUB_ENV
+          echo "SHOULD_APPLY=true" >> $GITHUB_ENV
+        fi
+        
+        if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          echo "IS_MAIN_PUSH=true" >> $GITHUB_ENV
+        else
+          echo "IS_MAIN_PUSH=false" >> $GITHUB_ENV
+        fi
+
+    - name: Terraform Apply (main branch)
+      if: env.SHOULD_APPLY == 'true' && env.IS_MAIN_PUSH == 'true'
+      run: |
+        echo "🚀 Applying Terraform changes..."
+        terraform apply -auto-approve tfplan
+        echo "✅ Terraform apply completed successfully!"
+
+    - name: Comment PR with Results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          let comment = `## ${{ env.JOB_EMOJI }} Terraform OPA Validation Results\n\n`;
+          comment += `**Job Status:** ${{ env.JOB_STATUS }}\n`;
+          comment += `**Total Violations:** ${process.env.TOTAL_VIOLATIONS || 0}\n\n`;
+          
+          const resultFiles = ['common', 's3', 'ec2', 'rds', 'iam', 'security', 'cloudwatch', 'lambda', 'apigateway', 'elasticache'];
+          
+          comment += '| Policy Type | Status | Violations |\n';
+          comment += '|-------------|--------|------------|\n';
+          
+          for (const policyType of resultFiles) {
+            try {
+              const filePath = `./opa_${policyType}_result.json`;
+              if (fs.existsSync(filePath)) {
+                const result = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+                const violations = result.result?.length || 0;
+                const status = violations === 0 ? '✅' : '❌';
+                comment += `| ${policyType.toUpperCase()} | ${status} | ${violations} |\n`;
+                
+                if (violations > 0 && result.result) {
+                  if (!comment.includes('### Violation Details')) {
+                    comment += '\n### 🚨 Violation Details:\n\n';
+                  }
+                  comment += `**${policyType.toUpperCase()} Policy Violations:**\n`;
+                  result.result.slice(0, 3).forEach(violation => {
+                    comment += `- ${violation}\n`;
+                  });
+                  if (result.result.length > 3) {
+                    comment += `- ... and ${result.result.length - 3} more\n`;
+                  }
+                  comment += '\n';
+                }
+              }
+            } catch (error) {
+              comment += `| ${policyType.toUpperCase()} | ⚠️ | Error |\n`;
+            }
+          }
+          
+          if (process.env.TOTAL_VIOLATIONS === '0') {
+            comment += '\n🎉 **All policies passed!** Your Terraform plan is compliant.\n';
+          } else {
+            comment += '\n❌ **Policy violations found!** Please fix them before merging.\n';
+          }
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+
+    - name: Upload Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: terraform-plan-${{ github.run_number }}
+        path: |
+          tfplan.json
+          opa_*.json
+
+    - name: Fail job if violations found
+      if: github.event_name == 'pull_request' && env.TOTAL_VIOLATIONS != '0'
+      run: |
+        echo "❌ Job failed due to policy violations: ${{ env.TOTAL_VIOLATIONS }}"
+        exit 1

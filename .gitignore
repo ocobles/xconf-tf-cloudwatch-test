@@ -1,0 +1,40 @@
+# Terraform files (recursively in all directories)
+**/.terraform/
+**/.terraform.lock.hcl
+**/terraform.tfvars
+**/terraform.tfstate*
+**/*.backup
+**/*.tfplan
+**/tfplan
+**/tfplan.*
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+.venv/
+uv.lock
+
+# Testing and temporary files
+**/bundle.tar.gz
+**/bundle/
+**/*.zip
+**/lambda_function_payload.zip
+
+# Security and credentials
+cognito_tokens.json
+scripts/setup-cognito-tokens.sh
+*.pem
+*.key
+.env
+.env.local
+.env.production
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
